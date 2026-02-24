@@ -1,0 +1,10 @@
+# 本地会话/调试产物（包含 cookie 等敏感信息）
+.state/
+.debug/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 建议把真实配置与密钥留在本地
+config.yaml

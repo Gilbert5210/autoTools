@@ -1,0 +1,79 @@
+# 配置说明：
+# - 真实使用时建议创建同目录的 config.yaml，并通过环境变量注入账号密码
+# - 支持 ${ENV_VAR} 形式引用环境变量
+
+global:
+  headless: true
+  concurrency: 3
+
+  # 浏览器内核策略（默认优先本机 Chrome）
+  browser:
+    prefer_local_chrome: true
+    channel: "chrome"                     # 可改为 msedge/chrome-beta 等
+    executable_path: ""                   # 可选：显式指定本机浏览器可执行文件
+    fallback_to_playwright_chromium: true
+
+  # 验证码识别
+  captcha:
+    expected_digits: 5         # 若不确定可设为 0（表示不校验长度）
+    ocr_max_attempts: 6        # 单次页面内识别重试（点击刷新验证码）
+    submit_max_attempts: 4     # 整体提交重试（含重新打开页面）
+    refresh_delay_ms: 250
+
+  # 相似名生成
+  similar_names:
+    enabled: true
+    max_variants: 10
+    # 常见近形/同音字映射（可按需扩展）
+    # 注意：这里的替换是“字符级”替换，只适合简单扩展；会自动去重并限额。
+    replace_map:
+      "壮": ["壮", "庄", "状", "装"]
+      "婷": ["婷", "亭", "庭"]
+      "伟": ["伟", "炜", "玮"]
+      "强": ["强", "墙", "抢"]
+      "敏": ["敏", "闵", "岷"]
+      "磊": ["磊", "蕾", "垒"]
+
+  # 输出文件（默认写到 autoTools/userList.md 与 autoTools/failed_names.md）
+  output:
+    user_list_md: "../userList.md"
+    failed_md: "../failed_names.md"
+    jsonl: "../userList.jsonl"
+    write_jsonl: true
+
+  timeouts_ms:
+    navigation: 25000
+    selector: 12000
+    result: 20000
+
+inputs:
+  names_file: "./names.txt"
+
+sites:
+  - name: "cbkx_whu"
+    login_url: "https://cbkx.whu.edu.cn/Journalx_cbkx/authorLogOn.action"
+
+    # 你需要把要查询的页面链接放在这里（可以多条）
+    # 通常是 Contribution!create22.action 这种页面
+    create_urls:
+      - "https://cbkx.whu.edu.cn/Journalx_cbkx/author/Contribution!create22.action?id=16159677204&flag=0&processId=1159659809"
+
+    credentials:
+      username: "${CBKX_USER}"
+      password: "${CBKX_PASS}"
+
+    selectors:
+      # 登录页
+      username: "#user_name"
+      password: "#password"
+      submit: "input[type='submit'], button[type='submit'], input[value*='登录'], button:has-text('登录')"
+
+      # 查询页（添加作者页面）
+      name_input: "#personSearch\\.name"
+      captcha_input: "#randomCode"
+      captcha_image: "#randomCodePic"
+      search_button: "input[value='添加作者']"
+
+      # 结果页
+      result_table: "table.list"
+
