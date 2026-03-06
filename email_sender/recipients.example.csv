@@ -1,0 +1,4 @@
+email,name,company,title,industry,template_id,last_contact_date
+alice@example.com,Alice,Acme Inc,Operations Manager,SaaS,intro,2026-03-01
+bob@example.com,Bob,Beta Tech,CTO,Manufacturing,follow_up,2026-02-20
+carol@example.com,Carol,CloudWorks,Founder,Education,intro,2026-03-03

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html as html_lib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from datetime import datetime
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import yaml
 
@@ -75,6 +77,12 @@ def _sha1_8(text: str) -> str:
 _CHAR_INDEX_KEY_RE = re.compile(r"^\d+$")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"(?:\+?86[- ]?)?1[3-9]\d{9}")
+_JOURNAL_ROOT_PATH_RE = re.compile(r"(/Journalx_[^/]+)", re.IGNORECASE)
+_SEARCH_AUTHORS_ACTION_RE = re.compile(
+    r"(https?://[^\s\"']*Contribution!searchAuthors\.action[^\s\"']*|/[^\s\"']*Contribution!searchAuthors\.action[^\s\"']*)",
+    re.IGNORECASE,
+)
+_CAPTCHA_SRC_RE = re.compile(r"id=[\"']randomCodePic[\"'][^>]*src=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 
 def _normalize_scalar_text(value: Any) -> str:
@@ -383,6 +391,15 @@ class QueryJob:
     query_name: str
 
 
+@dataclass
+class ApiQuerySpec:
+    create_url: str
+    resolved_create_url: str
+    search_action_url: str
+    captcha_url: str
+    form_defaults: Dict[str, str]
+
+
 class SiteSession:
     def __init__(
         self,
@@ -400,6 +417,7 @@ class SiteSession:
         self.ocr_engine = ocr_engine
         self.state_path = state_path
         self.debug_dir = debug_dir
+        self._api_spec_cache: Dict[str, ApiQuerySpec] = {}
 
     @property
     def name(self) -> str:
@@ -414,6 +432,183 @@ class SiteSession:
 
     def _log(self, message: str) -> None:
         print(f"[{self.name}] {message}")
+
+    def _query_cfg(self) -> Dict[str, Any]:
+        cfg = self.global_cfg.get("query")
+        return dict(cfg) if isinstance(cfg, dict) else {}
+
+    def _query_mode(self) -> str:
+        """
+        /* 查询通道选择：
+           - 默认 cbkx 站点走 auto（优先接口，失败回退页面）
+           - 其他站点默认维持 ui，避免对未知站点引入行为变化 */
+        """
+        default_mode = "auto" if self.name == "cbkx_whu" else "ui"
+        site_mode = str(self.site_cfg.get("query_mode") or "").strip().lower()
+        query_cfg = self._query_cfg()
+        global_mode = str(query_cfg.get("mode") or self.global_cfg.get("query_mode") or "").strip().lower()
+        mode = site_mode or global_mode or default_mode
+        if mode in {"ui", "api", "auto"}:
+            return mode
+        self._log(f"未知 query_mode={mode}，回退到默认模式 {default_mode}")
+        return default_mode
+
+    def _api_http_timeout_ms(self) -> int:
+        query_cfg = self._query_cfg()
+        return int(query_cfg.get("http_timeout_ms") or self._timeout("navigation", 25000))
+
+    def _resolve_abs_url(self, *, base_url: str, target_url: str) -> str:
+        if not target_url:
+            return ""
+        return urljoin(base_url, target_url)
+
+    def _extract_search_action_candidate(self, text: str) -> str:
+        if not text:
+            return ""
+        m = _SEARCH_AUTHORS_ACTION_RE.search(text)
+        if not m:
+            return ""
+        return html_lib.unescape(str(m.group(1) or "")).strip()
+
+    def _extract_captcha_src_candidate(self, text: str) -> str:
+        if not text:
+            return ""
+        m = _CAPTCHA_SRC_RE.search(text)
+        if not m:
+            return ""
+        return html_lib.unescape(str(m.group(1) or "")).strip()
+
+    def _build_captcha_request_url(self, *, captcha_url: str) -> str:
+        if not captcha_url:
+            return ""
+        cleaned = re.sub(r"([?&])d_a_=\d+", r"\1", captcha_url)
+        cleaned = re.sub(r"[?&]+$", "", cleaned)
+        sep = "&" if "?" in cleaned else "?"
+        return f"{cleaned}{sep}d_a_={int(time.time() * 1000)}"
+
+    def _build_captcha_url_candidates(self, *, captcha_url: str, base_url: str) -> List[str]:
+        """
+        /* 验证码地址候选：
+           - 优先使用页面提取值，再根据 Journalx 根路径推导兜底地址
+           - 部分页面会返回 /author/kaptcha.jpg（可能 404），自动补充 /kaptcha.jpg 候选 */
+        """
+        candidates: List[str] = []
+
+        def add(url: str) -> None:
+            u = str(url or "").strip()
+            if not u:
+                return
+            u = re.sub(r"([?&])d_a_=[^&]*", r"\1", u)
+            u = re.sub(r"[?&]+$", "", u)
+            if u not in candidates:
+                candidates.append(u)
+
+        add(captcha_url)
+
+        refs: List[str] = [
+            captcha_url,
+            base_url,
+            str(self.site_cfg.get("login_url") or ""),
+        ]
+        create_urls = self.site_cfg.get("create_urls") or []
+        if isinstance(create_urls, list) and create_urls:
+            refs.append(str(create_urls[0] or ""))
+
+        for ref in refs:
+            try:
+                parsed = urlparse(ref)
+            except Exception:
+                continue
+            if not parsed.scheme or not parsed.netloc:
+                continue
+
+            path = str(parsed.path or "")
+            prefix = f"{parsed.scheme}://{parsed.netloc}"
+
+            if path.endswith("/author/kaptcha.jpg"):
+                add(f"{prefix}{path[: -len('/author/kaptcha.jpg')]}/kaptcha.jpg")
+
+            m = _JOURNAL_ROOT_PATH_RE.search(path)
+            if m:
+                add(f"{prefix}{m.group(1)}/kaptcha.jpg")
+
+        return candidates
+
+    def _sanitize_response_html(self, html_text: str) -> str:
+        if not html_text:
+            return ""
+        return re.sub(r"<script[^>]*>.*?</script>", "", html_text, flags=re.IGNORECASE | re.DOTALL)
+
+    def _persist_api_response_html(
+        self,
+        *,
+        create_url: str,
+        base_name: str,
+        query_name: str,
+        submit_attempt: int,
+        response_status: int,
+        response_url: str,
+        html_text: str,
+    ) -> Path:
+        """
+        /* 接口响应 HTML 落盘：
+           - 在 API 查询通道中将待解析 HTML 持久化到本地
+           - 使用“确定文件名”覆盖写入，避免目录无限增长 */
+        """
+        dump_dir = self.debug_dir / "api_html"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        site_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.name).strip("_") or "site"
+        key = (
+            f"{site_key}_{_sha1_8(base_name)}_{_sha1_8(query_name)}_"
+            f"{_sha1_8(create_url)}_try{int(submit_attempt)}"
+        )
+        path = dump_dir / f"{key}.html"
+        path.write_text(html_text or "", encoding="utf-8")
+        return path
+
+    def _persist_api_captcha_image(
+        self,
+        *,
+        create_url: str,
+        base_name: str,
+        query_name: str,
+        submit_attempt: int,
+        captcha_url: str,
+        img_bytes: bytes,
+    ) -> Path:
+        """
+        /* 接口验证码图片落盘：
+           - 每次提交仅请求一次验证码并立即落盘
+           - 使用“确定文件名”覆盖写入，避免目录无限增长 */
+        """
+        dump_dir = self.debug_dir / "api_captcha"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        site_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.name).strip("_") or "site"
+        key = (
+            f"{site_key}_{_sha1_8(base_name)}_{_sha1_8(query_name)}_"
+            f"{_sha1_8(create_url)}_try{int(submit_attempt)}"
+        )
+        path = dump_dir / f"{key}.jpg"
+        path.write_bytes(img_bytes or b"")
+        return path
+
+    def _looks_like_login_response(self, *, final_url: str, html_text: str) -> bool:
+        if not final_url and not html_text:
+            return False
+        login_url = str(self.site_cfg.get("login_url") or "")
+        final_url = final_url or ""
+        if login_url and login_url in final_url:
+            return True
+        if "authorLogOn.action" in final_url or "Login.action" in final_url:
+            return True
+
+        low = (html_text or "").lower()
+        return bool(
+            re.search(r"id=['\"]user_name['\"]", low)
+            and re.search(r"id=['\"]password['\"]", low)
+        )
 
     def _login_success_url_hint(self) -> str:
         """
@@ -518,6 +713,7 @@ class SiteSession:
         page: Any,
         result_marker_sel: str,
         result_table_sel: str,
+        override_url: str = "",
     ) -> Dict[str, Any]:
         """
         /* 查询页结构采样：
@@ -526,7 +722,7 @@ class SiteSession:
         """
         try:
             data = await page.evaluate(
-                """({ markerSel, tableSel }) => {
+                r"""({ markerSel, tableSel }) => {
   const norm = (v) => String(v == null ? '' : v).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   const entryMap = new Map();
 
@@ -591,17 +787,19 @@ class SiteSession:
                 },
             )
         except Exception as e:
+            effective_url = str(override_url or page.url or "")
             return {
-                "url": page.url or "",
-                "is_search_authors_url": self._is_search_authors_url(page.url or ""),
+                "url": effective_url,
+                "is_search_authors_url": self._is_search_authors_url(effective_url),
                 "tables": [],
                 "signature_error": str(e),
             }
 
         if not isinstance(data, dict):
+            effective_url = str(override_url or page.url or "")
             return {
-                "url": page.url or "",
-                "is_search_authors_url": self._is_search_authors_url(page.url or ""),
+                "url": effective_url,
+                "is_search_authors_url": self._is_search_authors_url(effective_url),
                 "tables": [],
                 "signature_error": "invalid_signature_type",
             }
@@ -611,6 +809,10 @@ class SiteSession:
             data["tables"] = []
         else:
             data["tables"] = [x for x in tables if isinstance(x, dict)]
+
+        effective_url = str(override_url or data.get("url") or page.url or "")
+        data["url"] = effective_url
+        data["is_search_authors_url"] = self._is_search_authors_url(effective_url)
         return data
 
     def _select_result_table_signature(
@@ -798,7 +1000,7 @@ class SiteSession:
         """
         try:
             data = await page.evaluate(
-                """() => {
+                r"""() => {
   const userIdEl = document.querySelector('#user_id');
   const mi1El = document.querySelector('#mi1');
   const loginErrorEl = document.querySelector('#loginError');
@@ -1048,6 +1250,7 @@ class SiteSession:
         # 持久化会话
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         await self.context.storage_state(path=str(self.state_path))
+        self._api_spec_cache.clear()
         self._log(f"登录成功并持久化会话，state_path={self.state_path}")
 
     async def _collect_search_authors_skip_flags(self, *, page: Any) -> Dict[str, bool]:
@@ -1196,6 +1399,497 @@ class SiteSession:
 
             await page.wait_for_timeout(poll_interval)
 
+    async def _collect_api_query_spec(self, *, page: Any, create_url: str) -> Tuple[Optional[ApiQuerySpec], str]:
+        """
+        /* 接口入口采集：
+           - 从 create22 页面抽取 searchAuthors 动作地址、验证码地址和默认表单字段
+           - 采集失败时返回原因，供 auto 模式回退到 UI 流程 */
+        """
+        cached = self._api_spec_cache.get(create_url)
+        if cached is not None and cached.search_action_url and cached.captcha_url:
+            return cached, ""
+
+        try:
+            await page.goto(create_url, wait_until="domcontentloaded", timeout=self._timeout("navigation", 25000))
+        except PlaywrightTimeoutError:
+            return None, "接口模式打开查询页超时"
+
+        is_login_page, login_reason = await self._is_login_page(page)
+        if is_login_page:
+            self._log(f"接口模式检测到未登录，reason={login_reason}，url={page.url}")
+            await self._do_login(page)
+            try:
+                await page.goto(create_url, wait_until="domcontentloaded", timeout=self._timeout("navigation", 25000))
+            except PlaywrightTimeoutError:
+                return None, "接口模式登录后重新打开查询页超时"
+
+        try:
+            data = await page.evaluate(
+                r"""() => {
+  const formDefaults = {};
+  const nodes = Array.from(document.querySelectorAll('input[name],select[name],textarea[name]'));
+  for (const node of nodes) {
+    if (!node || node.disabled || !node.name) continue;
+    const tag = String(node.tagName || '').toLowerCase();
+    let value = '';
+
+    if (tag === 'select') {
+      value = String(node.value || '');
+    } else if (tag === 'textarea') {
+      value = String(node.value || '');
+    } else {
+      const type = String(node.type || '').toLowerCase();
+      if (type === 'checkbox' || type === 'radio') {
+        if (!node.checked) continue;
+        value = String(node.value || 'on');
+      } else if (type === 'submit' || type === 'button' || type === 'file') {
+        continue;
+      } else {
+        value = String(node.value || '');
+      }
+    }
+
+    if (!(node.name in formDefaults)) {
+      formDefaults[node.name] = value;
+    }
+  }
+
+  let checkAction = '';
+  try {
+    if (typeof check === 'function') {
+      const checkText = String(check);
+      const m = checkText.match(/Contribution!searchAuthors\.action[^"'\s]*/);
+      if (m && m[0]) checkAction = m[0];
+    }
+  } catch (e) {}
+
+  let scriptAction = '';
+  if (!checkAction) {
+    const scripts = Array.from(document.querySelectorAll('script')).map((s) => String(s.textContent || ''));
+    for (const txt of scripts) {
+      const m = txt.match(/Contribution!searchAuthors\.action[^"'\s]*/);
+      if (m && m[0]) {
+        scriptAction = m[0];
+        break;
+      }
+    }
+  }
+
+  const captchaEl = document.querySelector('#randomCodePic');
+  const captchaSrc = captchaEl ? String(captchaEl.src || captchaEl.getAttribute('src') || '') : '';
+
+  return {
+    page_url: String(location.href || ''),
+    check_action: checkAction,
+    script_action: scriptAction,
+    captcha_src: captchaSrc,
+    form_defaults: formDefaults,
+  };
+}"""
+            )
+        except Exception as e:
+            return None, f"接口模式采集页面结构失败：{e}"
+
+        if not isinstance(data, dict):
+            return None, "接口模式采集结果类型异常"
+
+        page_url = str(data.get("page_url") or page.url or create_url)
+        search_action_raw = str(data.get("check_action") or data.get("script_action") or "").strip()
+        captcha_src_raw = str(data.get("captcha_src") or "").strip()
+
+        page_html = ""
+        if not search_action_raw or not captcha_src_raw:
+            try:
+                page_html = await page.content()
+            except Exception:
+                page_html = ""
+
+        if not search_action_raw:
+            search_action_raw = self._extract_search_action_candidate(page_html)
+        if not captcha_src_raw:
+            captcha_src_raw = self._extract_captcha_src_candidate(page_html)
+
+        if not search_action_raw:
+            return None, "未提取到 searchAuthors 接口地址"
+
+        search_action_url = self._resolve_abs_url(base_url=page_url, target_url=search_action_raw)
+        captcha_url = self._resolve_abs_url(
+            base_url=page_url,
+            target_url=captcha_src_raw or "/Journalx_cbkx/kaptcha.jpg",
+        )
+
+        defaults_raw = data.get("form_defaults")
+        form_defaults: Dict[str, str] = {}
+        if isinstance(defaults_raw, dict):
+            for k, v in defaults_raw.items():
+                if not isinstance(k, str) or not k:
+                    continue
+                form_defaults[k] = "" if v is None else str(v)
+
+        form_defaults.setdefault("personSearch.rolsesp", "3")
+        form_defaults.setdefault("personSearch.email", "")
+
+        spec = ApiQuerySpec(
+            create_url=create_url,
+            resolved_create_url=page_url,
+            search_action_url=search_action_url,
+            captcha_url=captcha_url,
+            form_defaults=form_defaults,
+        )
+        self._api_spec_cache[create_url] = spec
+        self._log(
+            "接口地址识别完成 "
+            f"create={spec.resolved_create_url},captcha={spec.captcha_url},search={spec.search_action_url}"
+        )
+        return spec, ""
+
+    def _refresh_api_query_spec_from_response(
+        self,
+        *,
+        spec: ApiQuerySpec,
+        response_url: str,
+        response_html: str,
+    ) -> None:
+        """
+        /* 接口地址动态刷新：
+           - 部分页面会在响应脚本中刷新 id/processId
+           - 每次响应后尝试更新 search/captcha 地址，减少后续失配 */
+        """
+        base_url = response_url or spec.resolved_create_url or spec.create_url
+
+        action_raw = self._extract_search_action_candidate(response_html)
+        if action_raw:
+            spec.search_action_url = self._resolve_abs_url(base_url=base_url, target_url=action_raw)
+
+        captcha_raw = self._extract_captcha_src_candidate(response_html)
+        if captcha_raw:
+            spec.captcha_url = self._resolve_abs_url(base_url=base_url, target_url=captcha_raw)
+
+    async def _solve_captcha_digits_via_api(
+        self,
+        *,
+        spec: ApiQuerySpec,
+        create_url: str,
+        base_name: str,
+        query_name: str,
+        submit_attempt: int,
+        expected_digits: int,
+        ocr_max_attempts: int,
+        refresh_delay_ms: int,
+    ) -> Tuple[str, int, str]:
+        """
+        /* 接口验证码识别：
+           - 每次提交仅请求一次 kaptcha 图片并落盘
+           - OCR 仅针对本次图片识别，避免重复请求触发验证码刷新 */
+        """
+        if ddddocr is None or self.ocr_engine is None:
+            raise RuntimeError(_build_ddddocr_unavailable_message())
+
+        req_ctx = getattr(self.context, "request", None)
+        if req_ctx is None:
+            raise RuntimeError("当前 BrowserContext 不支持 request 接口")
+
+        captcha_candidates = self._build_captcha_url_candidates(
+            captcha_url=spec.captcha_url,
+            base_url=spec.resolved_create_url or spec.create_url,
+        )
+        if not captcha_candidates:
+            raise RuntimeError("验证码接口地址为空")
+
+        img_bytes: bytes | None = None
+        used_captcha_url = ""
+        last_req_error = ""
+        for candidate_url in captcha_candidates:
+            captcha_req_url = self._build_captcha_request_url(captcha_url=candidate_url)
+            if not captcha_req_url:
+                continue
+
+            try:
+                resp = await req_ctx.get(
+                    captcha_req_url,
+                    timeout=self._api_http_timeout_ms(),
+                    headers={"Referer": spec.resolved_create_url or spec.create_url},
+                )
+                status = int(resp.status)
+                if status < 200 or status >= 300:
+                    last_req_error = f"{candidate_url} -> captcha_status={status}"
+                    continue
+                body = await resp.body()
+                if not body:
+                    last_req_error = f"{candidate_url} -> empty_body"
+                    continue
+                img_bytes = body
+                used_captcha_url = candidate_url
+                break
+            except Exception as e:
+                last_req_error = f"{candidate_url} -> {e}"
+                continue
+
+        if img_bytes is None:
+            raise RuntimeError(f"验证码接口请求失败：{last_req_error or 'all_candidates_failed'}")
+
+        captcha_img_path = ""
+        try:
+            captcha_img_file = self._persist_api_captcha_image(
+                create_url=create_url,
+                base_name=base_name,
+                query_name=query_name,
+                submit_attempt=submit_attempt,
+                captcha_url=used_captcha_url or spec.captcha_url,
+                img_bytes=img_bytes,
+            )
+            captcha_img_path = str(captcha_img_file)
+            img_bytes = captcha_img_file.read_bytes()
+        except Exception as e:
+            self._log(f"验证码图片落盘失败，使用内存字节继续识别，error={e}")
+
+        max_ocr_attempts = max(1, int(ocr_max_attempts))
+        for attempt in range(1, max_ocr_attempts + 1):
+            raw = await asyncio.to_thread(self.ocr_engine.classification, img_bytes)
+            digits = re.sub(r"\D", "", str(raw or ""))
+            if digits and (expected_digits <= 0 or len(digits) == expected_digits):
+                if used_captcha_url and used_captcha_url != spec.captcha_url:
+                    self._log(f"验证码接口候选命中，from={spec.captcha_url}，selected={used_captcha_url}")
+                    spec.captcha_url = used_captcha_url
+                return digits, attempt, captcha_img_path
+
+            if attempt < max_ocr_attempts:
+                await asyncio.sleep(max(0, refresh_delay_ms) / 1000.0)
+
+        raise RuntimeError("接口验证码识别失败（本轮验证码仅请求一次）")
+
+    async def _query_author_via_api(
+        self,
+        *,
+        page: Any,
+        create_url: str,
+        base_name: str,
+        query_name: str,
+    ) -> Tuple[Optional[QueryResult], str]:
+        """
+        /* 接口优先查询：
+           - 复用登录态后直接请求 searchAuthors，减少页面跳转和 DOM 交互
+           - 若接口入口无法识别，返回 None 让上层回退 UI 查询 */
+        """
+        req_ctx = getattr(self.context, "request", None)
+        if req_ctx is None:
+            return None, "BrowserContext 不支持 request 接口"
+
+        captcha_cfg = dict((self.global_cfg.get("captcha") or {}))
+        expected_digits = int(captcha_cfg.get("expected_digits") or 0)
+        ocr_max_attempts = int(captcha_cfg.get("ocr_max_attempts") or 6)
+        submit_max_attempts = int(captcha_cfg.get("submit_max_attempts") or 4)
+        refresh_delay_ms = int(captcha_cfg.get("refresh_delay_ms") or 250)
+
+        sel = self.selectors
+        result_table_sel = sel.get("result_table") or "table.list"
+        result_marker_sel = self._result_row_marker_selector()
+
+        t0 = time.monotonic()
+        submit_attempts = 0
+        captcha_attempts_total = 0
+        last_error = ""
+        last_response_url = ""
+
+        debug: Dict[str, Any] = {
+            "result_page_verified": False,
+            "query_channel": "api",
+        }
+
+        def build_skip_result(skip_reason: str) -> QueryResult:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            debug["skip_reason"] = skip_reason
+            debug["final_url"] = last_response_url
+            return QueryResult(
+                ok=True,
+                site=self.name,
+                create_url=create_url,
+                base_name=base_name,
+                query_name=query_name,
+                final_url=last_response_url,
+                headers=[],
+                rows=[],
+                elapsed_ms=elapsed_ms,
+                submit_attempts=submit_attempts,
+                captcha_attempts=captcha_attempts_total,
+                debug=debug,
+            )
+
+        for submit_attempt in range(1, submit_max_attempts + 1):
+            submit_attempts = submit_attempt
+            debug["submit_attempt"] = submit_attempt
+
+            spec, spec_err = await self._collect_api_query_spec(page=page, create_url=create_url)
+            if spec is None:
+                return None, spec_err or "接口入口采集失败"
+
+            debug["api_search_action_url"] = spec.search_action_url
+            debug["api_captcha_url"] = spec.captcha_url
+
+            try:
+                captcha_text, captcha_attempts, captcha_img_path = await self._solve_captcha_digits_via_api(
+                    spec=spec,
+                    create_url=create_url,
+                    base_name=base_name,
+                    query_name=query_name,
+                    submit_attempt=submit_attempt,
+                    expected_digits=expected_digits,
+                    ocr_max_attempts=ocr_max_attempts,
+                    refresh_delay_ms=refresh_delay_ms,
+                )
+                if captcha_img_path:
+                    debug["api_captcha_image_path"] = captcha_img_path
+            except Exception as e:
+                last_error = f"接口验证码识别失败：{e}"
+                continue
+
+            captcha_attempts_total += captcha_attempts
+
+            payload = dict(spec.form_defaults)
+            payload["personSearch.name"] = query_name
+            payload["personSearch.email"] = str(payload.get("personSearch.email") or "")
+            payload["personSearch.rolsesp"] = str(payload.get("personSearch.rolsesp") or "3")
+            payload["randomCode"] = captcha_text
+
+            try:
+                response = await req_ctx.post(
+                    spec.search_action_url,
+                    form=payload,
+                    timeout=self._api_http_timeout_ms(),
+                    headers={"Referer": spec.resolved_create_url or spec.create_url},
+                )
+            except Exception as e:
+                last_error = f"接口提交失败：{e}"
+                self._api_spec_cache.pop(create_url, None)
+                continue
+
+            response_status = int(response.status)
+            response_url = str(response.url or "")
+            last_response_url = response_url
+            debug["api_response_status"] = response_status
+            debug["post_url"] = response_url
+
+            try:
+                response_text = await response.text()
+            except Exception as e:
+                last_error = f"读取接口响应失败：{e}"
+                continue
+
+            self._refresh_api_query_spec_from_response(
+                spec=spec,
+                response_url=response_url,
+                response_html=response_text,
+            )
+
+            if self._looks_like_login_response(final_url=response_url, html_text=response_text):
+                self._api_spec_cache.pop(create_url, None)
+                self._log(f"接口响应疑似回到登录页，触发重新登录，url={response_url}")
+                await self._do_login(page)
+                continue
+
+            sanitized_html = self._sanitize_response_html(response_text)
+            html_for_parse = sanitized_html or "<html><body></body></html>"
+            try:
+                html_file = self._persist_api_response_html(
+                    create_url=create_url,
+                    base_name=base_name,
+                    query_name=query_name,
+                    submit_attempt=submit_attempt,
+                    response_status=response_status,
+                    response_url=response_url,
+                    html_text=html_for_parse,
+                )
+                debug["api_response_html_path"] = str(html_file)
+                html_for_parse = html_file.read_text(encoding="utf-8")
+            except Exception as e:
+                debug["api_response_html_error"] = str(e)
+
+            try:
+                await page.set_content(html_for_parse, wait_until="domcontentloaded")
+            except Exception as e:
+                last_error = f"接口响应解析失败：{e}"
+                continue
+
+            skip_flags = await self._collect_search_authors_skip_flags(page=page)
+            debug["skip_flags"] = skip_flags
+            if skip_flags.get("should_cancel"):
+                return build_skip_result("命中searchAuthors补录页（接口判定）"), ""
+
+            page_signature = await self._collect_result_page_signature(
+                page=page,
+                result_marker_sel=result_marker_sel,
+                result_table_sel=result_table_sel,
+                override_url=response_url,
+            )
+            selected_table_signature, selected_reason = self._select_result_table_signature(
+                page_signature=page_signature,
+                result_marker_sel=result_marker_sel,
+                result_table_sel=result_table_sel,
+            )
+
+            debug["post_table_signature"] = self._compact_page_signature(page_signature)
+            debug["selected_table_signature"] = (
+                self._summarize_table_signature(selected_table_signature)
+                if selected_table_signature is not None
+                else ""
+            )
+            debug["selected_table_reason"] = selected_reason
+            debug["result_page_verified"] = bool(selected_table_signature is not None)
+
+            if selected_table_signature is None:
+                if selected_reason == "hit_create22_management_table":
+                    return build_skip_result("命中create22管理表，未产出可用作者结果"), ""
+                if self._is_search_authors_url(response_url):
+                    last_error = f"已进入searchAuthors但未命中目标结果表：{selected_reason or 'unknown'}"
+                else:
+                    last_error = f"接口返回非目标页：{selected_reason or 'unknown'}"
+                continue
+
+            raw_headers, raw_rows = await self._extract_table_from_signature(
+                page=page,
+                table_sig=selected_table_signature,
+            )
+            headers, rows = self._normalize_author_rows(raw_headers=raw_headers, raw_rows=raw_rows)
+            if not rows:
+                return build_skip_result("结果表中无有效Email，已按规则跳过"), ""
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return QueryResult(
+                ok=True,
+                site=self.name,
+                create_url=create_url,
+                base_name=base_name,
+                query_name=query_name,
+                final_url=response_url,
+                headers=headers,
+                rows=rows,
+                elapsed_ms=elapsed_ms,
+                submit_attempts=submit_attempts,
+                captcha_attempts=captcha_attempts_total,
+                debug=debug,
+            ), ""
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        debug["last_error"] = last_error
+        debug["final_url"] = last_response_url or page.url or ""
+        if captcha_attempts_total <= 0 and "验证码接口请求失败" in (last_error or ""):
+            return None, last_error or "接口验证码地址不可用"
+        return QueryResult(
+            ok=False,
+            site=self.name,
+            create_url=create_url,
+            base_name=base_name,
+            query_name=query_name,
+            final_url=last_response_url or page.url or "",
+            headers=[],
+            rows=[],
+            elapsed_ms=elapsed_ms,
+            submit_attempts=submit_attempts,
+            captcha_attempts=captcha_attempts_total,
+            error=last_error or "未知错误",
+            debug=debug,
+        ), ""
+
     async def query_author_on_page(
         self,
         *,
@@ -1204,6 +1898,37 @@ class SiteSession:
         base_name: str,
         query_name: str,
     ) -> QueryResult:
+        query_mode = self._query_mode()
+        if query_mode in {"api", "auto"}:
+            api_result, api_fallback_reason = await self._query_author_via_api(
+                page=page,
+                create_url=create_url,
+                base_name=base_name,
+                query_name=query_name,
+            )
+            if api_result is not None:
+                return api_result
+
+            if query_mode == "api":
+                return QueryResult(
+                    ok=False,
+                    site=self.name,
+                    create_url=create_url,
+                    base_name=base_name,
+                    query_name=query_name,
+                    final_url=page.url or "",
+                    headers=[],
+                    rows=[],
+                    elapsed_ms=0,
+                    submit_attempts=0,
+                    captcha_attempts=0,
+                    error=api_fallback_reason or "接口模式不可用",
+                    debug={"query_channel": "api"},
+                )
+
+            if api_fallback_reason:
+                self._log(f"接口模式不可用，已回退页面模式，reason={api_fallback_reason}")
+
         captcha_cfg = dict((self.global_cfg.get("captcha") or {}))
         expected_digits = int(captcha_cfg.get("expected_digits") or 0)
         ocr_max_attempts = int(captcha_cfg.get("ocr_max_attempts") or 6)
@@ -1361,6 +2086,9 @@ class SiteSession:
                 continue
 
             if outcome == "result_not_target":
+                if outcome_detail == "hit_create22_management_table":
+                    detach_dialog_listener()
+                    return build_skip_result("命中create22管理表，未产出可用作者结果")
                 last_error = f"已进入searchAuthors但未命中目标结果表：{outcome_detail or 'result_not_target'}"
                 continue
 
@@ -1389,6 +2117,9 @@ class SiteSession:
             debug["result_page_verified"] = bool(selected_table_signature is not None)
 
             if selected_table_signature is None:
+                if selected_reason == "hit_create22_management_table":
+                    detach_dialog_listener()
+                    return build_skip_result("命中create22管理表，未产出可用作者结果")
                 last_error = f"结果页二次校验未命中目标表：{selected_reason or 'unknown'}"
                 continue
 
@@ -1538,7 +2269,7 @@ class SiteSession:
             dom_index = -1
 
         data = await page.evaluate(
-            """({ domIndex }) => {
+            r"""({ domIndex }) => {
   const norm = (v) => String(v == null ? '' : v).replace(/\u00a0/g, ' ').replace(/^\s+|\s+$/g, '');
   const tables = Array.from(document.querySelectorAll('table'));
   if (domIndex < 0 || domIndex >= tables.length) return { headers: [], rows: [] };
@@ -1584,7 +2315,7 @@ class SiteSession:
         # 用页面内 JS 提取表头与数据行（比抓 HTML 再解析更稳一些）
         data = await page.eval_on_selector(
             table_sel,
-            """(table) => {
+            r"""(table) => {
   const norm = (v) => String(v == null ? '' : v).replace(/\u00a0/g, ' ').replace(/^\s+|\s+$/g, '');
   const rows = Array.from(table.querySelectorAll('tr'));
   if (!rows.length) return { headers: [], rows: [] };
@@ -1773,7 +2504,14 @@ def _build_realtime_aggregated_markdown(*, run_time: str, rows: List[List[str]])
     return "\n".join(lines)
 
 
-def _upsert_marked_block(path: Path, *, start_marker: str, end_marker: str, block_text: str) -> None:
+def _upsert_marked_block(
+    path: Path,
+    *,
+    start_marker: str,
+    end_marker: str,
+    block_text: str,
+    insert_at_top_when_missing: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "\n".join([start_marker, block_text.rstrip(), end_marker, ""])
 
@@ -1790,9 +2528,12 @@ def _upsert_marked_block(path: Path, *, start_marker: str, end_marker: str, bloc
             end_tail += 1
         new_text = source[:start_idx] + payload + source[end_tail:]
     else:
-        if source and not source.endswith("\n"):
-            source = source + "\n"
-        new_text = source + payload
+        if insert_at_top_when_missing:
+            new_text = payload + source
+        else:
+            if source and not source.endswith("\n"):
+                source = source + "\n"
+            new_text = source + payload
     path.write_text(new_text, encoding="utf-8")
 
 
@@ -1899,6 +2640,10 @@ async def _run(cfg_path: Path, *, names_override: Optional[Path], concurrency_ov
     concurrency = int(global_cfg.get("concurrency") or 3)
     site_concurrency_cfg = dict(global_cfg.get("site_concurrency") or {})
     default_site_concurrency = int(global_cfg.get("site_worker_concurrency") or concurrency or 1)
+    query_cfg = dict(global_cfg.get("query") or {})
+    name_poll_interval_ms = int(query_cfg.get("name_poll_interval_ms") or 200)
+    if name_poll_interval_ms < 0:
+        name_poll_interval_ms = 0
     if default_site_concurrency <= 0:
         default_site_concurrency = 1
     browser_cfg = dict(global_cfg.get("browser") or {})
@@ -1978,8 +2723,12 @@ async def _run(cfg_path: Path, *, names_override: Optional[Path], concurrency_ov
             write_lock = asyncio.Lock()
             aggregated_keys: set[Tuple[str, str, str, str]] = set()
             aggregated_rows: List[List[str]] = []
-            realtime_block_start = "<!-- AUTO_TOOLS_REALTIME_AGGREGATED_START -->"
-            realtime_block_end = "<!-- AUTO_TOOLS_REALTIME_AGGREGATED_END -->"
+            run_block_key = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+            # /* userList.md 聚合块策略：
+            #    - 同一轮运行：使用同一组标记，实时更新始终覆盖该运行对应表格
+            #    - 不同轮运行：标记带 run_block_key，每次重跑都会新增一个新表格块 */
+            realtime_block_start = f"<!-- AUTO_TOOLS_REALTIME_AGGREGATED_START:{run_block_key} -->"
+            realtime_block_end = f"<!-- AUTO_TOOLS_REALTIME_AGGREGATED_END:{run_block_key} -->"
 
             def collect_new_aggregated_rows(result: QueryResult) -> bool:
                 if (not result.ok) or _is_skipped_result(result):
@@ -2010,6 +2759,7 @@ async def _run(cfg_path: Path, *, names_override: Optional[Path], concurrency_ov
                         start_marker=realtime_block_start,
                         end_marker=realtime_block_end,
                         block_text=block_text,
+                        insert_at_top_when_missing=True,
                     )
 
             async def consume_result(result: QueryResult) -> None:
@@ -2083,6 +2833,8 @@ async def _run(cfg_path: Path, *, names_override: Optional[Path], concurrency_ov
 
                             await consume_result(result)
                             site_queue.task_done()
+                            if name_poll_interval_ms > 0:
+                                await asyncio.sleep(name_poll_interval_ms / 1000.0)
                     finally:
                         try:
                             await page.close()

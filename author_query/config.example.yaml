@@ -25,6 +25,15 @@ global:
     post_submit_timeout_ms: 10000
     post_submit_poll_interval_ms: 350
 
+  # 查询通道：
+  # - auto: 优先走接口请求，失败时回退页面点击
+  # - api: 仅接口请求（不回退）
+  # - ui: 仅页面点击（历史模式）
+  query:
+    mode: auto
+    http_timeout_ms: 25000
+    name_poll_interval_ms: 200
+
   # 相似名生成
   similar_names:
     enabled: false
@@ -41,6 +50,7 @@ global:
   output:
     user_list_md: "../userList.md"
     failed_md: "../failed_names.md"
+    skipped_md: "../skipped_names.md"
     jsonl: "../userList.jsonl"
     write_jsonl: true
 
@@ -54,6 +64,11 @@ inputs:
 
 sites:
   - name: "cbkx_whu"
+    query_mode: auto
+    # 可选：登录成功 URL 强信号（cbkx 默认会使用 /author/Author.action）
+    login_success_url_contains: "/author/Author.action"
+    # 可选：是否允许原始 form.submit() 兜底（cbkx 默认 false）
+    allow_raw_form_submit: false
     login_url: "https://cbkx.whu.edu.cn/Journalx_cbkx/authorLogOn.action"
     create_urls:
       - "https://cbkx.whu.edu.cn/Journalx_cbkx/author/Contribution!create22.action?id=16159677204&flag=0&processId=1159659809"
@@ -71,3 +86,5 @@ sites:
       captcha_image: "#randomCodePic"
       search_button: "input[value='添加作者']"
       result_table: "table.list"
+      # 可选：结果页行标记（cbkx 默认就是 sid 单选框）
+      result_row_marker: "input[type='radio'][name='sid']"

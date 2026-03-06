@@ -1,0 +1,153 @@
+# Copy this file to config.yaml and fill in real values.
+
+runtime:
+  # Send N emails, then sleep for batch_interval_seconds +/- batch_interval_jitter_seconds.
+  batch_size: 10
+  batch_interval_seconds: 10
+  batch_interval_jitter_seconds: 2
+
+  # Delay between every email in a batch to avoid fixed sending pattern.
+  per_email_delay_seconds: 1.5
+  per_email_delay_jitter_seconds: 1.5
+
+  # SMTP socket timeout.
+  smtp_timeout_seconds: 20
+  smtp_retry_count: 2
+  smtp_retry_backoff_seconds: 3
+
+  # If consecutive failures reach threshold, pause sending for cooldown.
+  failure_pause_threshold: 3
+  failure_pause_seconds: 120
+
+  # Optional fixed seed for deterministic waits in testing; null for production randomness.
+  random_seed:
+
+  # true = simulation only, no real SMTP send.
+  dry_run: false
+
+  # Output CSV report directory.
+  report_dir: "./reports"
+
+  # true = skip invalid email rows in recipients file.
+  skip_invalid_recipient_email: true
+
+# Multiple sender accounts. Password is directly configured here as requested.
+senders:
+  - id: "sender_a"
+    from_name: "BD Team A"
+    email: "sender_a@your-company.com"
+    password: "password_for_sender_a"
+    smtp_host: "smtp.exmail.qq.com"
+    smtp_port: 587
+    use_ssl: false
+    use_tls: true
+
+  - id: "sender_b"
+    from_name: "BD Team B"
+    email: "sender_b@your-company.com"
+    password: "password_for_sender_b"
+    smtp_host: "smtp.exmail.qq.com"
+    smtp_port: 587
+    use_ssl: false
+    use_tls: true
+
+recipients:
+  # Supports .csv / .tsv / .txt
+  file: "./recipients.csv"
+
+  # Column name that stores recipient email address.
+  email_field: "email"
+
+  # If templates.selection = by_recipient_field, this field decides template per row.
+  template_id_field: "template_id"
+
+templates:
+  # by_recipient_field: choose template by recipients.template_id_field
+  # round_robin: rotate templates automatically
+  selection: "by_recipient_field"
+
+  # Default template when recipient row has no template_id.
+  default_template_id: "intro"
+
+  # You can define multiple templates here.
+  items:
+    - id: "intro"
+      subject_template: "{name} 您好，关于 {company} 的一份合作建议"
+      prompt_template: |
+        请帮我写一封中文商务开发邮件正文。
+        目标：介绍我们的自动化与AI服务，并邀请15分钟沟通。
+        收件人姓名：{name}
+        收件人公司：{company}
+        收件人职位：{title}
+        业务行业：{industry}
+        我方联系人：{sender_name} ({sender_email})
+
+        要求：
+        1) 专业、礼貌、简洁；
+        2) 150-220字；
+        3) 结尾包含明确行动号召（可回复邮件或预约时间）；
+        4) 不要使用占位符。
+      fallback_body_template: |
+        {name} 您好，
+
+        我们团队长期服务于 {industry} 行业，近期关注到 {company} 在自动化提效方面有较大潜力。
+        想和您约一个15分钟沟通，分享我们在流程自动化与AI落地上的实践，看是否能帮助贵司提升效率。
+
+        如果方便，欢迎直接回复本邮件，我们可按您的时间安排沟通。
+
+        {sender_name}
+        {sender_email}
+      content_subtype: "plain"
+
+    - id: "follow_up"
+      subject_template: "跟进：给 {company} 的自动化提效建议"
+      prompt_template: |
+        请基于“商务跟进”场景，生成一封中文跟进邮件正文。
+        收件人姓名：{name}
+        收件人公司：{company}
+        收件人职位：{title}
+        上次联系时间：{last_contact_date}
+        我方联系人：{sender_name} ({sender_email})
+
+        要求：
+        1) 语气友好但不啰嗦；
+        2) 120-180字；
+        3) 体现跟进背景并提出下一步行动。
+      fallback_body_template: |
+        {name} 您好，
+
+        上次我们就 {company} 的自动化提效方向做了初步触达，想再跟进一下。
+        如果您这周有10-15分钟，我们可以快速交流下具体场景，给您一版更贴合业务的建议。
+
+        期待您的回复。
+
+        {sender_name}
+        {sender_email}
+      content_subtype: "plain"
+
+ai:
+  enabled: true
+  # true: prefer local Codex config (~/.codex/config.toml + auth.json)
+  use_local_codex: false
+  local_codex_home: "~/.codex"
+  provider: "openai_compatible"
+
+  # chat_completions: POST {base_url}/chat/completions
+  # responses: POST {base_url}/responses
+  api_style: "chat_completions"
+
+  # OpenAI example: https://api.openai.com/v1
+  # When use_local_codex=true, empty/default values can be auto-filled from local Codex config.
+  base_url: "https://api.openai.com/v1"
+  api_key: "sk-xxxxxx"
+  model: "gpt-4.1-mini"
+
+  # Optional global system prompt.
+  system_prompt: |
+    你是一名专业的企业商务邮件助手。请严格按用户要求生成中文邮件正文。
+
+  temperature: 0.7
+  max_tokens: 500
+  timeout_seconds: 30
+  retries: 2
+  retry_backoff_seconds: 2
