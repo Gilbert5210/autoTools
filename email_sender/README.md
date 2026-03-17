@@ -40,6 +40,8 @@ cp autoTools/email_sender/config.example.yaml autoTools/email_sender/config.yaml
 - `senders`：填写企业邮箱账号、密码、SMTP 地址与端口
 - `recipients.file`：指向你的收件人列表文件
 - `templates.items`：填写你的定制模板
+- `templates.items[].attachment_paths`：可选附件路径列表（如联系方式图片）
+- `templates.items[].inline_image_paths`：可选图片附件路径列表（兼容字段名）
 - `runtime.batch_size`：每批发送数量（默认 10）
 - `runtime.batch_interval_seconds`：批次间隔秒数（默认 10）
 - `runtime.per_email_delay_seconds`：单封邮件间隔（建议 >= 1）
@@ -51,8 +53,18 @@ cp autoTools/email_sender/config.example.yaml autoTools/email_sender/config.yaml
 
 - `ai.use_local_codex: true`
 - `ai.local_codex_home: "~/.codex"`
+- `ai.provider: "codex_cli"`（推荐，直接调用本机 `codex exec`）
+- `ai.reasoning_effort: "low"`（建议，避免全局 `xhigh` 导致生成过慢）
 
-启用后脚本会自动读取 `~/.codex/config.toml` 与 `~/.codex/auth.json` 来补全 `base_url/model/api_style/api_key`。
+启用后有两种模式：
+
+- `ai.provider: "codex_cli"`：直接调用本机 `codex exec` 生成正文，最适合已经能正常使用 Codex CLI 的环境。
+- `ai.provider: "openai_compatible"`：脚本读取 `~/.codex/config.toml` 与 `~/.codex/auth.json`，补全 `base_url/model/api_style/api_key` 后直接请求兼容接口。
+
+建议：
+
+- `codex_cli` 模式下将 `ai.timeout_seconds` 设为 `>= 60`（推荐 `120`）。
+- 若你本机 `~/.codex/config.toml` 使用 `model_reasoning_effort = "xhigh"`，可在本项目配置 `ai.reasoning_effort: "low"`，单独降低邮件生成耗时。
 
 3. 准备收件人 CSV，例如：
 
@@ -130,16 +142,24 @@ python autoTools/email_sender/main.py --config autoTools/email_sender/config.yam
 - 收件人字段：`{name}`、`{company}`、`{title}` 等（来自 CSV 头）
 - 内置字段：`{sender_name}`、`{sender_email}`、`{today}`、`{send_index}`、`{total_count}`
 
+模板还支持可选附件字段：
+
+- `attachment_paths`：列表，支持相对/绝对路径；发送时会作为邮件附件一并发出。
+- `inline_image_paths`：列表，支持相对/绝对路径；按普通附件发送（不插入正文）。
+
 ## 输出
 
 每次运行都会写入一个 CSV 报告，默认目录：`runtime.report_dir`（例如 `email_sender/reports/`）。
 
 报告字段：
 
+- `timestamp`：`YYYY-MM-DD HH:mm:ss`
 - `status`：`SENT` / `FAILED` / `DRY_RUN`
 - `recipient_email`
 - `sender_email`
 - `template_id`
+- `subject`
+- `body`：邮件正文（包含 AI 或 fallback 生成内容）
 - `ai_used`
 - `error`
 

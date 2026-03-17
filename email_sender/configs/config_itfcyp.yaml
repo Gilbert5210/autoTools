@@ -1,0 +1,261 @@
+runtime:
+  batch_size: 10
+  batch_interval_seconds: 30
+  batch_interval_jitter_seconds: 60
+  per_email_delay_seconds: 60
+  per_email_delay_jitter_seconds: 100
+
+  smtp_timeout_seconds: 25
+  smtp_retry_count: 3
+  smtp_retry_backoff_seconds: 20
+
+  failure_pause_threshold: 3
+  failure_pause_seconds: 120
+
+  random_seed:
+  dry_run: false
+  report_dir: "../reports"
+  skip_invalid_recipient_email: true
+
+senders:
+  - id: "itfcyp_0001"
+    from_name: "赵编辑"
+    email: "iris@itfcyp.cn"
+    password: "iLhElwcWRb"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0002"
+    from_name: "钱编辑"
+    email: "joy@itfcyp.cn"
+    password: "bF9pAmKHLz"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0003"
+    from_name: "孙编辑"
+    email: "miya@itfcyp.cn"
+    password: "x3qwuARCM7"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0004"
+    from_name: "李编辑"
+    email: "rose@itfcyp.cn"
+    password: "emwizDr0gY"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0005"
+    from_name: "周编辑"
+    email: "tina@itfcyp.cn"
+    password: "6E4YgSwViL"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0006"
+    from_name: "吴编辑"
+    email: "lucy@itfcyp.cn"
+    password: "kjrEfcxJQM"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0007"
+    from_name: "郑编辑"
+    email: "lee@itfcyp.cn"
+    password: "O3Q6vNdJfh"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0008"
+    from_name: "王编辑"
+    email: "ken@itfcyp.cn"
+    password: "Tr2bj5Dq9a"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0009"
+    from_name: "冯编辑"
+    email: "bill@itfcyp.cn"
+    password: "CcQpbgFWKA"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0010"
+    from_name: "陈编辑"
+    email: "alex@itfcyp.cn"
+    password: "btf7UKn5gR"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0011"
+    from_name: "褚编辑"
+    email: "aaron@itfcyp.cn"
+    password: "nAcdGprP1o"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0012"
+    from_name: "卫编辑"
+    email: "tony@itfcyp.cn"
+    password: "KGNLjfUMkq"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0013"
+    from_name: "蒋编辑"
+    email: "tom@itfcyp.cn"
+    password: "rVWB5b0CQK"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0014"
+    from_name: "沈编辑"
+    email: "gary@itfcyp.cn"
+    password: "QEtnZgvSr2"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+  - id: "itfcyp_0015"
+    from_name: "韩编辑"
+    email: "joan@itfcyp.cn"
+    password: "sLi4mlMH5p"
+    smtp_host: "smtp.bestedm.net"
+    smtp_port: 25
+    use_ssl: false
+    use_tls: false
+
+recipients:
+  file: "../sendFileList/sendFile_2.csv"
+  email_field: "email"
+  template_id_field: "template_id"
+
+templates:
+  selection: "by_recipient_field"
+  default_template_id: "intro"
+  items:
+    - id: "intro"
+      subject_template: "{name}医生，想和您分享一份论文润色与投稿经验"
+      prompt_template: |
+        请你以“医学论文辅助与润色顾问”的身份，写一封发给医院医生的中文开发邮件正文。
+        收件人姓名：{name}
+        所在单位：{company}
+        职位：{title}
+        研究方向/学科关键词：{industry}
+        我方联系人：{sender_name} (（V:Gilbert5210）)
+
+        写作目标：
+        - 让医生感受到我们是真诚、专业、值得信任的论文辅助伙伴；
+        - 让对方愿意进一步咨询，并主动加微信或电话沟通；
+        - 语气要亲切自然，像同行间认真交流，而不是生硬推销。
+        - 即使资料字段不完整，也要写得自然、得体，不能出现生硬空缺感。
+
+        核心内容（必须覆盖）：
+        - 先表达对对方所在方向科研工作的尊重与关注，开头要自然；
+        - 点出医生常见痛点，如论文表达不够学术、逻辑结构不清、返修回复困难、选刊拿不准、审稿周期过长等；
+        - 明确说明我们能提供的帮助，包括论文润色、结构梳理、投稿材料优化、审稿意见回复辅助；
+        - 可自然带入一个真实感较强的小案例：某位同级别医院医生的稿件在润色和修回后顺利推进投稿；
+        - 结尾温和邀请对方，如近期有初稿、返修稿、积压数据或选刊问题，欢迎加微信或电话沟通，我们可以先免费交流思路。
+
+        字段缺失时的兜底规则（非常重要）：
+        - 如果 `title` 为空，不要猜测对方职称，不要写“主任/副主任/主治”等具体身份；
+        - 如果 `industry` 为空，不要硬写具体学科方向，改用“临床研究”“医学科研”“论文发表”“学术写作”等更自然的泛化表达；
+        - 如果 `company` 信息有限，就用“贵院”“您所在团队”等自然称呼替代；
+        - 全文不要暴露“字段缺失”这件事，不要出现明显拼接痕迹。
+
+        输出要求（严格遵守）：
+        1) 开头必须是“{name}医生，您好：”；
+        2) 正文约180-260字，分3-4段；
+        3) 语气真诚、亲切、专业、有温度，不夸张承诺；
+        4) 禁止出现“包发表/保证录用”等表述；
+        5) 避免明显营销口号，避免“最后机会”“限时”等销售化措辞；
+        6) 每次生成时请换一种自然表达，避免重复套话；
+        7) 只输出邮件正文，不要解释，不要出现占位符。
+      fallback_body_template: |
+        {name}医生，您好：
+
+        一直关注贵院在临床研究方面的积累，也理解一线医生在繁忙工作中推进论文写作并不容易。冒昧来信，是想和您分享一套更务实、节省时间的论文推进思路。
+
+        我们近期协助一位同级别三甲医院医生，将一篇被拒稿3次的临床回顾性文章，通过语言润色、结构梳理和返修回复优化后，在约2个月内顺利进入接收流程。
+
+        很多医生真正卡住的并不是数据本身，而是英文表达不够学术、逻辑层次不清、返修意见回复拿捏不准，以及选刊节奏反复试错。
+
+        如果您近期有初稿、返修稿或积压数据，欢迎直接加我微信 （V:Gilbert5210），我可以先根据您的稿件阶段给您做一次免费的1对1发表路径建议，帮您先判断“优先改哪几步更省时间”。
+
+        我已把微信联系方式图片作为邮件附件附上，您可直接查看并添加；也欢迎回邮“资料”，我把拒稿逆袭案例和审稿回复模板发您参考。
+
+        {sender_name}
+        （V:Gilbert5210）
+      content_subtype: "html"
+      attachment_paths: []
+
+    - id: "follow_up"
+      subject_template: "{name}老师，给您准备了一份2026下半年SCI选刊白名单"
+      prompt_template: |
+        请你以“医学论文服务顾问”的身份，写一封中文跟进邮件正文。
+        收件人姓名：{name}
+        所在单位：{company}
+        职位：{title}
+        学科/研究方向：{industry}
+        上次联系时间：{last_contact_date}
+        我方联系人：{sender_name} ({sender_email})
+
+        核心信息（必须覆盖）：
+        - 开头使用“{name}老师，您好：”；
+        - 提及近期很多{industry}方向医生在准备职称论文，且期刊审稿周期变长；
+        - 说明你整理了一份“《2026年下半年医学各科室审稿快、易录用的SCI期刊白名单（附版面费及影响因子）》”；
+        - 说明文件为Excel格式、内容详细；
+        - 引导对方如近期有发表计划，可加微信领取资料。
+
+        输出要求（严格遵守）：
+        1) 170-240字，3-4段；
+        2) 语气专业、友好、克制，不夸张承诺；
+        3) 禁止出现“包发表/保证录用”等表述；
+        4) 只输出邮件正文，不要解释，不要出现占位符。
+      fallback_body_template: |
+        {name}老师，您好：
+
+        最近看到很多医生在准备职称论文，但不少期刊的审稿周期都在变长。
+
+        我花了一周时间，专门剔除了最新的“预警期刊”，整理了一份《2026年下半年医学各科室审稿快、易录用的SCI期刊白名单（附版面费及影响因子）》。
+
+        这份资料是Excel格式，内容比较详细。如果您近期有发表计划，可以加我微信，我直接发给您备用，希望能帮您节省选刊时间。
+
+        我已把微信联系方式图片作为邮件附件附上，您可直接查看并添加。
+
+        {sender_name}
+        （V:Gilbert5210）
+      content_subtype: "html"
+      attachment_paths: []
+
+ai:
+  enabled: false
+  use_local_codex: true
+  local_codex_home: "~/.codex"
+  provider: "codex_cli"
+  reasoning_effort: "low"
+  api_style: ""
+  base_url: ""
+  api_key: ""
+  model: ""
+  system_prompt: |
+    你是一名专业的企业商务邮件助手。请严格按要求生成中文邮件正文。
+  temperature: 0.7
+  max_tokens: 500
+  timeout_seconds: 120
+  retries: 2
+  retry_backoff_seconds: 2

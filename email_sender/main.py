@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
+import mimetypes
 import os
 import random
 import re
+import shutil
 import smtplib
+import subprocess
 import sys
+import tempfile
 import time
 from builtins import TimeoutError as BuiltinTimeoutError
 from dataclasses import dataclass
@@ -16,8 +21,9 @@ from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Protocol, TextIO
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import socket
 
@@ -32,6 +38,19 @@ except ModuleNotFoundError:  # pragma: no cover
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 AI_KEY_PLACEHOLDERS = {"", "sk-xxxxxx", "your_api_key", "change_me", "placeholder"}
+REPORT_FIELDNAMES = [
+    "timestamp",
+    "status",
+    "recipient_email",
+    "recipient_name",
+    "sender_id",
+    "sender_email",
+    "template_id",
+    "subject",
+    "body",
+    "ai_used",
+    "error",
+]
 
 
 class ConfigError(ValueError):
@@ -62,6 +81,8 @@ class TemplateConfig:
     prompt_template: str
     fallback_body_template: str
     content_subtype: str
+    attachment_paths: tuple[Path, ...]
+    inline_image_paths: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -95,6 +116,7 @@ class AIConfig:
     use_local_codex: bool
     local_codex_home: Optional[str]
     provider: str
+    reasoning_effort: str
     api_style: str
     base_url: str
     api_key: str
@@ -119,6 +141,13 @@ class AppConfig:
     ai: AIConfig
 
 
+class AITextClient(Protocol):
+    provider_name: str
+
+    def generate(self, prompt: str) -> str:
+        ...
+
+
 class TemplateSelector:
     def __init__(
         self,
@@ -127,59 +156,87 @@ class TemplateSelector:
         default_template_id: str,
         selection: str,
         template_id_field: str,
+        rng: random.Random,
     ) -> None:
         self.templates = templates
         self.template_order = template_order
         self.default_template_id = default_template_id
         self.selection = selection
         self.template_id_field = template_id_field
+        self.rng = rng
 
     def pick(self, index: int, recipient: Dict[str, str]) -> TemplateConfig:
-        if self.selection == "round_robin":
-            template_id = self.template_order[index % len(self.template_order)]
-            return self.templates[template_id]
-
-        recipient_template_id = (recipient.get(self.template_id_field) or "").strip()
-        if recipient_template_id and recipient_template_id in self.templates:
-            return self.templates[recipient_template_id]
-
-        if self.default_template_id in self.templates:
-            return self.templates[self.default_template_id]
-
-        return self.templates[self.template_order[0]]
+        _ = index
+        _ = recipient
+        template_id = self.rng.choice(self.template_order)
+        return self.templates[template_id]
 
 
 class OpenAICompatibleClient:
+    provider_name = "openai_compatible"
+
     def __init__(self, cfg: AIConfig):
         self.cfg = cfg
 
     def generate(self, prompt: str) -> str:
         last_error: Optional[Exception] = None
         attempts = self.cfg.retries + 1
+        request_variants = list(self._iter_request_variants(prompt))
 
         for attempt in range(1, attempts + 1):
-            try:
-                if self.cfg.api_style == "responses":
-                    payload = self._build_responses_payload(prompt)
-                    response = self._post_json(f"{self.cfg.base_url.rstrip('/')}/responses", payload)
-                else:
-                    payload = self._build_chat_completions_payload(prompt)
-                    response = self._post_json(
-                        f"{self.cfg.base_url.rstrip('/')}/chat/completions", payload
-                    )
+            for url, payload in request_variants:
+                try:
+                    response = self._post_json(url, payload)
+                    text = self._extract_text(response)
+                    if not text:
+                        raise RuntimeError("AI response was empty")
+                    return text
+                except Exception as exc:  # pragma: no cover - network path
+                    last_error = exc
 
-                text = self._extract_text(response)
-                if not text:
-                    raise RuntimeError("AI response was empty")
-                return text
-            except Exception as exc:  # pragma: no cover - network path
-                last_error = exc
-                if attempt < attempts:
-                    time.sleep(self.cfg.retry_backoff_seconds * attempt)
+            if attempt < attempts:
+                time.sleep(self.cfg.retry_backoff_seconds * attempt)
 
-        raise RuntimeError(f"AI generate failed after {attempts} attempts: {last_error}")
+        raise RuntimeError(
+            f"AI generate failed after {attempts} attempts and {len(request_variants)} request variants: {last_error}"
+        )
 
-    def _build_chat_completions_payload(self, prompt: str) -> Dict[str, Any]:
+    def _iter_request_variants(self, prompt: str) -> Iterable[tuple[str, Dict[str, Any]]]:
+        if self.cfg.api_style == "responses":
+            payloads = self._build_responses_payload_variants(prompt)
+            urls = self._build_endpoint_variants("responses")
+        else:
+            payloads = self._build_chat_completions_payload_variants(prompt)
+            urls = self._build_endpoint_variants("chat/completions")
+
+        for url in urls:
+            for payload in payloads:
+                yield url, payload
+
+    def _build_endpoint_variants(self, endpoint: str) -> List[str]:
+        base_url = self.cfg.base_url.rstrip("/")
+        parsed = urllib_parse.urlsplit(base_url)
+        path = parsed.path.rstrip("/")
+        candidates: List[str] = []
+
+        def add_candidate(url: str) -> None:
+            if url and url not in candidates:
+                candidates.append(url)
+
+        if path.endswith(f"/{endpoint}"):
+            add_candidate(base_url)
+            return candidates
+
+        add_candidate(f"{base_url}/{endpoint}")
+
+        if path in {"", "/"}:
+            add_candidate(f"{base_url}/v1/{endpoint}")
+        elif path != "/v1" and not path.endswith("/v1"):
+            add_candidate(f"{base_url}/v1/{endpoint}")
+
+        return candidates
+
+    def _build_chat_completions_payload_variants(self, prompt: str) -> List[Dict[str, Any]]:
         messages: List[Dict[str, str]] = []
         if self.cfg.system_prompt:
             messages.append({"role": "system", "content": self.cfg.system_prompt})
@@ -188,26 +245,88 @@ class OpenAICompatibleClient:
         payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
-            "temperature": self.cfg.temperature,
         }
+        if self.cfg.temperature >= 0:
+            payload["temperature"] = self.cfg.temperature
         if self.cfg.max_tokens is not None:
             payload["max_tokens"] = self.cfg.max_tokens
-        return payload
 
-    def _build_responses_payload(self, prompt: str) -> Dict[str, Any]:
-        input_items: List[Dict[str, str]] = []
+        variants = [payload]
+        if "temperature" in payload:
+            variants.append({k: v for k, v in payload.items() if k != "temperature"})
+        return variants
+
+    def _build_responses_payload_variants(self, prompt: str) -> List[Dict[str, Any]]:
+        combined_prompt = prompt
         if self.cfg.system_prompt:
-            input_items.append({"role": "system", "content": self.cfg.system_prompt})
-        input_items.append({"role": "user", "content": prompt})
+            combined_prompt = f"{self.cfg.system_prompt.rstrip()}\n\n{prompt}".strip()
 
-        payload: Dict[str, Any] = {
+        payload_simple: Dict[str, Any] = {
             "model": self.cfg.model,
-            "input": input_items,
-            "temperature": self.cfg.temperature,
+            "input": prompt,
         }
+        if self.cfg.system_prompt:
+            payload_simple["instructions"] = self.cfg.system_prompt
+        if self.cfg.temperature >= 0:
+            payload_simple["temperature"] = self.cfg.temperature
         if self.cfg.max_tokens is not None:
-            payload["max_output_tokens"] = self.cfg.max_tokens
-        return payload
+            payload_simple["max_output_tokens"] = self.cfg.max_tokens
+
+        payload_structured: Dict[str, Any] = {
+            "model": self.cfg.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ],
+        }
+        if self.cfg.system_prompt:
+            payload_structured["instructions"] = self.cfg.system_prompt
+        if self.cfg.temperature >= 0:
+            payload_structured["temperature"] = self.cfg.temperature
+        if self.cfg.max_tokens is not None:
+            payload_structured["max_output_tokens"] = self.cfg.max_tokens
+
+        payload_simple_combined: Dict[str, Any] = {
+            "model": self.cfg.model,
+            "input": combined_prompt,
+        }
+        if self.cfg.temperature >= 0:
+            payload_simple_combined["temperature"] = self.cfg.temperature
+        if self.cfg.max_tokens is not None:
+            payload_simple_combined["max_output_tokens"] = self.cfg.max_tokens
+
+        payload_structured_combined: Dict[str, Any] = {
+            "model": self.cfg.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": combined_prompt}],
+                }
+            ],
+        }
+        if self.cfg.temperature >= 0:
+            payload_structured_combined["temperature"] = self.cfg.temperature
+        if self.cfg.max_tokens is not None:
+            payload_structured_combined["max_output_tokens"] = self.cfg.max_tokens
+
+        variants = [
+            payload_simple,
+            payload_structured,
+            payload_simple_combined,
+            payload_structured_combined,
+        ]
+        variants.extend({k: v for k, v in item.items() if k != "temperature"} for item in variants)
+
+        deduped: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in variants:
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        return deduped
 
     def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
@@ -264,6 +383,99 @@ class OpenAICompatibleClient:
         return ""
 
 
+class CodexCLIClient:
+    provider_name = "codex_cli"
+
+    def __init__(self, cfg: AIConfig):
+        self.cfg = cfg
+
+    def generate(self, prompt: str) -> str:
+        codex_bin = shutil.which("codex")
+        if not codex_bin:
+            raise RuntimeError("Local Codex CLI not found in PATH")
+
+        final_prompt = self._build_prompt(prompt)
+        output_path: Optional[Path] = None
+
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+                output_path = Path(f.name)
+
+            command = [
+                codex_bin,
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--color",
+                "never",
+                "--ephemeral",
+                "-c",
+                f"model_reasoning_effort={json.dumps(self.cfg.reasoning_effort)}",
+                "-m",
+                self.cfg.model,
+                "--output-last-message",
+                str(output_path),
+                final_prompt,
+            ]
+
+            log(
+                f"AI request start provider=codex_cli model={self.cfg.model} "
+                f"reasoning_effort={self.cfg.reasoning_effort} timeout={self.cfg.timeout_seconds}s"
+            )
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.cfg.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if output_path is not None:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"Local Codex CLI timeout after {self.cfg.timeout_seconds}s"
+            ) from exc
+
+        if completed.returncode != 0:
+            if output_path is not None:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            details = (completed.stderr or completed.stdout or "").strip().replace("\n", " ")
+            raise RuntimeError(f"Local Codex CLI failed: {details[:500]}")
+
+        if not output_path or not output_path.exists():
+            raise RuntimeError("Local Codex CLI did not produce output file")
+
+        try:
+            text = output_path.read_text(encoding="utf-8").strip()
+        finally:
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        cleaned = _cleanup_generated_text(text)
+        if not cleaned:
+            raise RuntimeError("Local Codex CLI returned empty content")
+        return cleaned
+
+    def _build_prompt(self, prompt: str) -> str:
+        parts = [
+            "你是一名专业的企业商务邮件助手。",
+            "请严格遵循下方输出格式要求，不要输出解释、分析、代码块或任何额外说明。",
+        ]
+        if self.cfg.system_prompt:
+            parts.append(self.cfg.system_prompt)
+        parts.append(prompt)
+        return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
 def _extract_content_text(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -282,6 +494,57 @@ def _extract_content_text(content: Any) -> str:
                         texts.append(maybe)
         return "\n".join(x.strip() for x in texts if x and x.strip())
     return ""
+
+
+def _cleanup_generated_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 3:
+            cleaned = "\n".join(lines[1:-1]).strip()
+    return cleaned
+
+
+def _build_subject_body_prompt(prompt: str, subject_hint: str) -> str:
+    return (
+        "请基于下面的邮件写作要求，同时生成一个邮件标题和一封邮件正文。\n\n"
+        "原始写作要求：\n"
+        f"{prompt}\n\n"
+        "标题要求：\n"
+        "1) 18-32字；\n"
+        "2) 真诚、亲切、专业，不夸张，不营销腔；\n"
+        "3) 让医生愿意点开并继续阅读；\n"
+        f"4) 可参考但不要照抄这个备选标题：{subject_hint}\n\n"
+        "输出格式要求（严格遵守）：\n"
+        "第一行必须以 `SUBJECT:` 开头，后面直接写邮件标题。\n"
+        "第二行必须是 `BODY:`\n"
+        "从第三行开始只写邮件正文。\n"
+        "不要添加任何解释、前言、后记、代码块或多余标记。"
+    )
+
+
+def _parse_generated_subject_body(text: str) -> tuple[str, str]:
+    cleaned = _cleanup_generated_text(text)
+    subject_match = re.search(r"(?mi)^\s*(?:SUBJECT|标题|主题)\s*[:：]\s*(.+?)\s*$", cleaned)
+    if not subject_match:
+        raise RuntimeError("AI response missing SUBJECT line")
+
+    body_marker = re.search(r"(?mi)^\s*(?:BODY|正文)\s*[:：]?\s*$", cleaned)
+    if not body_marker:
+        inline_body = re.search(r"(?mis)^\s*(?:BODY|正文)\s*[:：]\s*(.+)$", cleaned)
+        if inline_body:
+            body = inline_body.group(1).strip()
+        else:
+            raise RuntimeError("AI response missing BODY section")
+    else:
+        body = cleaned[body_marker.end() :].strip()
+
+    subject = subject_match.group(1).strip()
+    if not subject:
+        raise RuntimeError("AI response subject was empty")
+    if not body:
+        raise RuntimeError("AI response body was empty")
+    return subject, body
 
 
 def log(message: str) -> None:
@@ -375,6 +638,44 @@ def _is_empty_or_default(value: str, defaults: set[str]) -> bool:
     return value.strip() == "" or value.strip().lower() in {x.lower() for x in defaults}
 
 
+def _parse_template_file_paths(
+    config_dir: Path,
+    template_item: Dict[str, Any],
+    template_index: int,
+    field_name: str,
+) -> tuple[Path, ...]:
+    raw_paths = template_item.get(field_name, [])
+    if raw_paths is None:
+        path_items: List[Any] = []
+    elif isinstance(raw_paths, str):
+        path_items = [raw_paths]
+    elif isinstance(raw_paths, list):
+        path_items = raw_paths
+    else:
+        raise ConfigError(f"templates.items[{template_index}].{field_name} must be a list or string")
+
+    parsed_paths: List[Path] = []
+    for path_index, raw_path in enumerate(path_items):
+        path_value = str(raw_path or "").strip()
+        if not path_value:
+            raise ConfigError(
+                f"templates.items[{template_index}].{field_name}[{path_index}] cannot be empty"
+            )
+
+        resolved_path = resolve_path(config_dir, path_value)
+        if not resolved_path.exists():
+            raise ConfigError(
+                f"templates.items[{template_index}].{field_name}[{path_index}] not found: {resolved_path}"
+            )
+        if not resolved_path.is_file():
+            raise ConfigError(
+                f"templates.items[{template_index}].{field_name}[{path_index}] is not a file: {resolved_path}"
+            )
+        parsed_paths.append(resolved_path)
+
+    return tuple(parsed_paths)
+
+
 def load_local_codex_ai_defaults(codex_home: Optional[str]) -> Dict[str, str]:
     if tomllib is None:
         raise ConfigError("Python >= 3.11 is required to parse local codex config (tomllib missing)")
@@ -435,6 +736,12 @@ def load_local_codex_ai_defaults(codex_home: Optional[str]) -> Dict[str, str]:
         "api_style": wire_api,
         "api_key": api_key,
     }
+
+
+def build_ai_client(ai: AIConfig) -> AITextClient:
+    if ai.provider == "codex_cli":
+        return CodexCLIClient(ai)
+    return OpenAICompatibleClient(ai)
 
 
 def parse_config(raw: Dict[str, Any], config_dir: Path) -> AppConfig:
@@ -584,12 +891,27 @@ def parse_config(raw: Dict[str, Any], config_dir: Path) -> AppConfig:
                 f"templates.items[{idx}].content_subtype must be plain or html, got {content_subtype}"
             )
 
+        attachment_paths = _parse_template_file_paths(
+            config_dir=config_dir,
+            template_item=item,
+            template_index=idx,
+            field_name="attachment_paths",
+        )
+        inline_image_paths = _parse_template_file_paths(
+            config_dir=config_dir,
+            template_item=item,
+            template_index=idx,
+            field_name="inline_image_paths",
+        )
+
         templates[template_id] = TemplateConfig(
             template_id=template_id,
             subject_template=subject_template,
             prompt_template=prompt_template,
             fallback_body_template=str(item.get("fallback_body_template", "")).rstrip(),
             content_subtype=content_subtype,
+            attachment_paths=attachment_paths,
+            inline_image_paths=inline_image_paths,
         )
         template_order.append(template_id)
 
@@ -605,6 +927,7 @@ def parse_config(raw: Dict[str, Any], config_dir: Path) -> AppConfig:
     ai_use_local_codex = to_bool(ai_raw.get("use_local_codex", False), default=False)
     ai_local_codex_home = str(ai_raw.get("local_codex_home", "")).strip() or None
     ai_provider = str(ai_raw.get("provider", "openai_compatible")).strip() or "openai_compatible"
+    ai_reasoning_effort = str(ai_raw.get("reasoning_effort", "low")).strip().lower() or "low"
     ai_api_style = str(ai_raw.get("api_style", "chat_completions")).strip() or "chat_completions"
     ai_base_url = str(ai_raw.get("base_url", "https://api.openai.com/v1")).strip() or "https://api.openai.com/v1"
     ai_api_key = str(ai_raw.get("api_key", "")).strip()
@@ -627,6 +950,7 @@ def parse_config(raw: Dict[str, Any], config_dir: Path) -> AppConfig:
         use_local_codex=ai_use_local_codex,
         local_codex_home=ai_local_codex_home,
         provider=ai_provider,
+        reasoning_effort=ai_reasoning_effort,
         api_style=ai_api_style,
         base_url=ai_base_url,
         api_key=ai_api_key,
@@ -646,11 +970,13 @@ def parse_config(raw: Dict[str, Any], config_dir: Path) -> AppConfig:
     )
 
     if ai.enabled:
-        if ai.provider != "openai_compatible":
-            raise ConfigError("Only ai.provider=openai_compatible is supported")
+        if ai.provider not in {"openai_compatible", "codex_cli"}:
+            raise ConfigError("ai.provider must be openai_compatible or codex_cli")
+        if ai.reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            raise ConfigError("ai.reasoning_effort must be low / medium / high / xhigh")
         if ai.api_style not in {"chat_completions", "responses"}:
             raise ConfigError("ai.api_style must be chat_completions or responses")
-        if not ai.api_key:
+        if ai.provider == "openai_compatible" and not ai.api_key:
             raise ConfigError("ai.api_key is required when ai.enabled=true")
 
     return AppConfig(
@@ -744,17 +1070,23 @@ def build_context(
     return context
 
 
-def create_body(
+def create_subject_and_body(
     template: TemplateConfig,
     context: Dict[str, str],
-    ai_client: Optional[OpenAICompatibleClient],
-) -> tuple[str, bool]:
+    ai_client: Optional[AITextClient],
+) -> tuple[str, str, bool]:
     prompt = render_template(template.prompt_template, context)
+    fallback_subject = render_template(template.subject_template, context) or "(No Subject)"
     if ai_client is not None:
         try:
-            generated = ai_client.generate(prompt)
-            if generated.strip():
-                return generated.strip(), True
+            log(
+                f"AI generate start provider={ai_client.provider_name} recipient={context.get('email', '')} "
+                f"template={template.template_id}"
+            )
+            generated = ai_client.generate(_build_subject_body_prompt(prompt, fallback_subject))
+            subject, body = _parse_generated_subject_body(generated)
+            if subject.strip() and body.strip():
+                return subject.strip(), body.strip(), True
         except Exception as exc:
             log(
                 f"AI failed for recipient={context.get('email', '')}, "
@@ -762,9 +1094,23 @@ def create_body(
             )
 
     if template.fallback_body_template:
-        return render_template(template.fallback_body_template, context), False
+        return fallback_subject, render_template(template.fallback_body_template, context), False
 
-    return prompt, False
+    return fallback_subject, prompt, False
+
+
+def _guess_mime_parts(file_path: Path) -> tuple[str, str]:
+    mime_type, _ = mimetypes.guess_type(str(file_path))
+    if mime_type and "/" in mime_type:
+        return tuple(mime_type.split("/", 1))  # type: ignore[return-value]
+    return "application", "octet-stream"
+
+
+def _normalize_html_body(body: str) -> str:
+    if re.search(r"<[A-Za-z][^>]*>", body):
+        return body
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    return html.escape(normalized).replace("\n", "<br>\n")
 
 
 def send_email(
@@ -774,6 +1120,8 @@ def send_email(
     body: str,
     content_subtype: str,
     smtp_timeout_seconds: int,
+    attachment_paths: Iterable[Path] = (),
+    inline_image_paths: Iterable[Path] = (),
 ) -> None:
     message = EmailMessage()
     message["From"] = formataddr((sender.from_name, sender.email)) if sender.from_name else sender.email
@@ -781,10 +1129,28 @@ def send_email(
     message["Subject"] = subject
 
     if content_subtype == "html":
+        html_body = _normalize_html_body(body)
         message.set_content("This is an HTML email. Please use an HTML-compatible mail client.")
-        message.add_alternative(body, subtype="html")
+        message.add_alternative(html_body, subtype="html")
     else:
         message.set_content(body)
+
+    for attachment_path in attachment_paths:
+        maintype, subtype = _guess_mime_parts(attachment_path)
+        message.add_attachment(
+            attachment_path.read_bytes(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment_path.name,
+        )
+    for inline_image_path in inline_image_paths:
+        maintype, subtype = _guess_mime_parts(inline_image_path)
+        message.add_attachment(
+            inline_image_path.read_bytes(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=inline_image_path.name,
+        )
 
     if sender.use_ssl:
         with smtplib.SMTP_SSL(
@@ -851,29 +1217,24 @@ def compute_wait_seconds(base: float, jitter: float, rng: random.Random) -> floa
     return max(0.0, value)
 
 
-def write_report(report_dir: Path, rows: Iterable[Dict[str, str]]) -> Path:
+def create_report_writer(report_dir: Path) -> tuple[Path, TextIO, csv.DictWriter]:
     report_dir.mkdir(parents=True, exist_ok=True)
     file_path = report_dir / f"send_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    report_file = file_path.open("w", encoding="utf-8", newline="")
+    writer = csv.DictWriter(report_file, fieldnames=REPORT_FIELDNAMES)
+    writer.writeheader()
+    report_file.flush()
+    return file_path, report_file, writer
 
-    fieldnames = [
-        "timestamp",
-        "status",
-        "recipient_email",
-        "recipient_name",
-        "sender_id",
-        "sender_email",
-        "template_id",
-        "subject",
-        "ai_used",
-        "error",
-    ]
 
-    with file_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+def write_report(report_dir: Path, rows: Iterable[Dict[str, str]]) -> Path:
+    file_path, report_file, writer = create_report_writer(report_dir)
+    try:
         for row in rows:
             writer.writerow(row)
-
+        report_file.flush()
+    finally:
+        report_file.close()
     return file_path
 
 
@@ -888,24 +1249,25 @@ def run(config: AppConfig, *, dry_run_override: bool, start_index: int, limit: i
         log("No recipients to process")
         return 0
 
-    ai_client = OpenAICompatibleClient(config.ai) if config.ai.enabled else None
+    rng = random.Random(config.runtime.random_seed)
+    ai_client = build_ai_client(config.ai) if config.ai.enabled else None
     selector = TemplateSelector(
         templates=config.templates,
         template_order=config.template_order,
         default_template_id=config.default_template_id,
         selection=config.template_selection,
         template_id_field=config.recipients.template_id_field,
+        rng=rng,
     )
 
     dry_run = config.runtime.dry_run or dry_run_override
     total = len(recipients)
-    rng = random.Random(config.runtime.random_seed)
 
     sent_count = 0
     failed_count = 0
     dry_run_count = 0
     consecutive_failures = 0
-    report_rows: List[Dict[str, str]] = []
+    report_path, report_file, report_writer = create_report_writer(config.runtime.report_dir)
 
     log(
         f"Start sending: total={total}, senders={len(config.senders)}, "
@@ -916,139 +1278,145 @@ def run(config: AppConfig, *, dry_run_override: bool, start_index: int, limit: i
     )
     if config.ai.enabled and config.ai.use_local_codex:
         log(
-            f"AI source=local_codex model={config.ai.model} api_style={config.ai.api_style} "
-            f"base_url={config.ai.base_url}"
+            f"AI source=local_codex provider={config.ai.provider} model={config.ai.model} "
+            f"reasoning_effort={config.ai.reasoning_effort} "
+            f"api_style={config.ai.api_style} base_url={config.ai.base_url}"
         )
+    try:
+        for idx, recipient in enumerate(recipients):
+            recipient_email = recipient.get(config.recipients.email_field, "").strip()
+            recipient_name = recipient.get("name", "").strip()
+            sender = config.senders[idx % len(config.senders)]
 
-    for idx, recipient in enumerate(recipients):
-        recipient_email = recipient.get(config.recipients.email_field, "").strip()
-        recipient_name = recipient.get("name", "").strip()
-        sender = config.senders[idx % len(config.senders)]
-
-        status = "FAILED"
-        error_message = ""
-        ai_used = "false"
-        template_id = ""
-        subject = ""
-
-        try:
-            template = selector.pick(idx, recipient)
-            template_id = template.template_id
-
-            context = build_context(recipient, sender, idx + 1, total)
-            subject = render_template(template.subject_template, context) or "(No Subject)"
-            body, used_ai = create_body(template, context, ai_client)
-            ai_used = "true" if used_ai else "false"
-
-            if not dry_run:
-                max_attempts = config.runtime.smtp_retry_count + 1
-                send_error: Optional[Exception] = None
-                for send_attempt in range(1, max_attempts + 1):
-                    try:
-                        send_email(
-                            sender=sender,
-                            to_email=recipient_email,
-                            subject=subject,
-                            body=body,
-                            content_subtype=template.content_subtype,
-                            smtp_timeout_seconds=config.runtime.smtp_timeout_seconds,
-                        )
-                        send_error = None
-                        break
-                    except Exception as exc:
-                        send_error = exc
-                        transient = is_transient_smtp_error(exc)
-                        has_next_attempt = send_attempt < max_attempts
-                        if transient and has_next_attempt:
-                            retry_wait = (
-                                config.runtime.smtp_retry_backoff_seconds * send_attempt
-                            ) + rng.uniform(0, 1.5)
-                            log(
-                                f"[{idx + 1}/{total}] SMTP retry {send_attempt}/{config.runtime.smtp_retry_count} "
-                                f"recipient={recipient_email} wait={retry_wait:.2f}s error={exc}"
-                            )
-                            if not no_wait and retry_wait > 0:
-                                time.sleep(retry_wait)
-                            continue
-                        raise send_error
-
-                status = "SENT"
-                sent_count += 1
-                consecutive_failures = 0
-                log(
-                    f"[{idx + 1}/{total}] SENT recipient={recipient_email} "
-                    f"sender={sender.email} template={template.template_id}"
-                )
-            else:
-                status = "DRY_RUN"
-                dry_run_count += 1
-                consecutive_failures = 0
-                log(
-                    f"[{idx + 1}/{total}] DRY_RUN recipient={recipient_email} "
-                    f"sender={sender.email} template={template.template_id}"
-                )
-        except Exception as exc:
             status = "FAILED"
-            failed_count += 1
-            consecutive_failures += 1
-            error_message = str(exc)
-            log(f"[{idx + 1}/{total}] FAILED recipient={recipient_email} error={error_message}")
+            error_message = ""
+            ai_used = "false"
+            template_id = ""
+            subject = ""
+            body = ""
 
-        report_rows.append(
-            {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "status": status,
-                "recipient_email": recipient_email,
-                "recipient_name": recipient_name,
-                "sender_id": sender.sender_id,
-                "sender_email": sender.email,
-                "template_id": template_id,
-                "subject": subject,
-                "ai_used": ai_used,
-                "error": error_message,
-            }
-        )
+            try:
+                template = selector.pick(idx, recipient)
+                template_id = template.template_id
 
-        reached_batch_end = (idx + 1) % config.runtime.batch_size == 0
-        has_more = (idx + 1) < total
-        if (
-            has_more
-            and not no_wait
-            and consecutive_failures >= config.runtime.failure_pause_threshold
-            and config.runtime.failure_pause_seconds > 0
-        ):
-            cooldown = compute_wait_seconds(
-                config.runtime.failure_pause_seconds,
-                config.runtime.per_email_delay_jitter_seconds,
-                rng,
+                context = build_context(recipient, sender, idx + 1, total)
+                subject, body, used_ai = create_subject_and_body(template, context, ai_client)
+                ai_used = "true" if used_ai else "false"
+
+                if not dry_run:
+                    max_attempts = config.runtime.smtp_retry_count + 1
+                    send_error: Optional[Exception] = None
+                    for send_attempt in range(1, max_attempts + 1):
+                        try:
+                            send_email(
+                                sender=sender,
+                                to_email=recipient_email,
+                                subject=subject,
+                                body=body,
+                                content_subtype=template.content_subtype,
+                                smtp_timeout_seconds=config.runtime.smtp_timeout_seconds,
+                                attachment_paths=template.attachment_paths,
+                                inline_image_paths=template.inline_image_paths,
+                            )
+                            send_error = None
+                            break
+                        except Exception as exc:
+                            send_error = exc
+                            transient = is_transient_smtp_error(exc)
+                            has_next_attempt = send_attempt < max_attempts
+                            if transient and has_next_attempt:
+                                retry_wait = (
+                                    config.runtime.smtp_retry_backoff_seconds * send_attempt
+                                ) + rng.uniform(0, 1.5)
+                                log(
+                                    f"[{idx + 1}/{total}] SMTP retry {send_attempt}/{config.runtime.smtp_retry_count} "
+                                    f"recipient={recipient_email} wait={retry_wait:.2f}s error={exc}"
+                                )
+                                if not no_wait and retry_wait > 0:
+                                    time.sleep(retry_wait)
+                                continue
+                            raise send_error
+
+                    status = "SENT"
+                    sent_count += 1
+                    consecutive_failures = 0
+                    log(
+                        f"[{idx + 1}/{total}] SENT recipient={recipient_email} "
+                        f"sender={sender.email} template={template.template_id}"
+                    )
+                else:
+                    status = "DRY_RUN"
+                    dry_run_count += 1
+                    consecutive_failures = 0
+                    log(
+                        f"[{idx + 1}/{total}] DRY_RUN recipient={recipient_email} "
+                        f"sender={sender.email} template={template.template_id}"
+                    )
+            except Exception as exc:
+                status = "FAILED"
+                failed_count += 1
+                consecutive_failures += 1
+                error_message = str(exc)
+                log(f"[{idx + 1}/{total}] FAILED recipient={recipient_email} error={error_message}")
+
+            report_writer.writerow(
+                {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": status,
+                    "recipient_email": recipient_email,
+                    "recipient_name": recipient_name,
+                    "sender_id": sender.sender_id,
+                    "sender_email": sender.email,
+                    "template_id": template_id,
+                    "subject": subject,
+                    "body": body,
+                    "ai_used": ai_used,
+                    "error": error_message,
+                }
             )
-            log(
-                f"Consecutive failures={consecutive_failures}, activate cooldown {cooldown:.2f}s "
-                f"before continuing"
-            )
-            time.sleep(cooldown)
-            consecutive_failures = 0
+            report_file.flush()
 
-        if has_more and not no_wait:
-            if reached_batch_end:
-                wait_seconds = compute_wait_seconds(
-                    config.runtime.batch_interval_seconds,
-                    config.runtime.batch_interval_jitter_seconds,
-                    rng,
-                )
-                log(f"Batch complete, sleep {wait_seconds:.2f}s before next batch")
-                time.sleep(wait_seconds)
-            else:
-                wait_seconds = compute_wait_seconds(
-                    config.runtime.per_email_delay_seconds,
+            reached_batch_end = (idx + 1) % config.runtime.batch_size == 0
+            has_more = (idx + 1) < total
+            if (
+                has_more
+                and not no_wait
+                and consecutive_failures >= config.runtime.failure_pause_threshold
+                and config.runtime.failure_pause_seconds > 0
+            ):
+                cooldown = compute_wait_seconds(
+                    config.runtime.failure_pause_seconds,
                     config.runtime.per_email_delay_jitter_seconds,
                     rng,
                 )
-                if wait_seconds > 0:
-                    log(f"Inter-email delay {wait_seconds:.2f}s")
-                    time.sleep(wait_seconds)
+                log(
+                    f"Consecutive failures={consecutive_failures}, activate cooldown {cooldown:.2f}s "
+                    f"before continuing"
+                )
+                time.sleep(cooldown)
+                consecutive_failures = 0
 
-    report_path = write_report(config.runtime.report_dir, report_rows)
+            if has_more and not no_wait:
+                if reached_batch_end:
+                    wait_seconds = compute_wait_seconds(
+                        config.runtime.batch_interval_seconds,
+                        config.runtime.batch_interval_jitter_seconds,
+                        rng,
+                    )
+                    log(f"Batch complete, sleep {wait_seconds:.2f}s before next batch")
+                    time.sleep(wait_seconds)
+                else:
+                    wait_seconds = compute_wait_seconds(
+                        config.runtime.per_email_delay_seconds,
+                        config.runtime.per_email_delay_jitter_seconds,
+                        rng,
+                    )
+                    if wait_seconds > 0:
+                        log(f"Inter-email delay {wait_seconds:.2f}s")
+                        time.sleep(wait_seconds)
+    finally:
+        report_file.close()
+
     log(
         f"Finished. sent={sent_count}, failed={failed_count}, dry_run={dry_run_count}, "
         f"report={report_path}"
