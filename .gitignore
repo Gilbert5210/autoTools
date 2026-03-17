@@ -17,8 +17,8 @@ userList.md
 failed_names.md
 skipped_names.md
 userList.jsonl
-email_sender/config.yaml
-email_sender/recipients.csv
+email_sender/configs/config.yaml
+email_sender/sendFileList/recipients.csv
 email_sender/reports/
 
 # Query runtime state and debug artifacts

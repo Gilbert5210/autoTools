@@ -1,6 +1,6 @@
 ---
 name: "cnki-advsearch-api-export"
-description: "Use when you need fast CNKI KNS8 advanced-search extraction via /kns8s/brief/grid and CSV export (paper rows + author summary), especially for medical subjects A006/E056/E057."
+description: "Use when you need fast CNKI KNS8 advanced-search extraction via /kns8s/brief/grid and CSV export (paper rows + author summary + author contact info)."
 ---
 
 # CNKI Advanced Search API Export Skill
@@ -8,10 +8,7 @@ description: "Use when you need fast CNKI KNS8 advanced-search extraction via /k
 ## When to use
 - Need to export CNKI advanced-search results faster than UI page-by-page scraping.
 - Need paper-level CSV and author-level CSV from the same query.
-- Need medical subject filtering for:
-  - `A006` 生物学
-  - `E056` 中医学
-  - `E057` 中药学
+- Need keyword-focused extraction (default keyword: `病`) and author contact enrichment.
 
 ## Script
 - `scripts/export_cnki_advsearch_csv.py`
@@ -29,13 +26,13 @@ From repo root:
 ```bash
 python3 skills/cnki-advsearch-api-export/scripts/export_cnki_advsearch_csv.py \
   --url "https://kns.cnki.net/kns8s/AdvSearch?classid=YSTT4HG0&isFirst=1&rlang=both" \
-  --subject-codes "A006,E056,E057" \
+  --keyword "病" \
   --output-dir "output/spreadsheet"
 ```
 
 ## Outputs
-- `output/spreadsheet/cnki_medical_records.csv`
-- `output/spreadsheet/cnki_medical_authors.csv`
+- `output/spreadsheet/cnki_medical_records.csv`（含每条文献作者联系方式字段）
+- `output/spreadsheet/cnki_medical_authors.csv`（含作者聚合联系方式字段）
 
 ## Useful options
 - Limit pages:
@@ -50,6 +47,10 @@ python3 skills/cnki-advsearch-api-export/scripts/export_cnki_advsearch_csv.py \
 ```bash
 --headed
 ```
+- Slow down author-contact requests to reduce anti-bot risk:
+```bash
+--author-contact-delay-ms 120
+```
 - Save extracted `briefRequest` payload:
 ```bash
 --save-brief-request output/spreadsheet/brief_request.json
@@ -61,5 +62,5 @@ python3 skills/cnki-advsearch-api-export/scripts/export_cnki_advsearch_csv.py \
 
 ## Notes
 - The script uses CNKI page session + `/brief/grid` interface pagination.
-- Subject filters are first attempted through in-page DOM apply; if missing, payload is patched with `CCL` conditions.
+- Keyword is patched into query payload (`SU=病` by default), and any `CCL` subject filter conditions are removed.
 - If CNKI returns anti-bot or empty pages intermittently, retry with `--headed` and increase `--delay-ms`.
